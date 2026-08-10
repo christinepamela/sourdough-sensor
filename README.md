@@ -96,6 +96,11 @@ In the Arduino IDE the same setting is **Tools → Partition Scheme → Huge APP
 | v0.7 | Feature 3 — time-to-peak prediction, phase classification, maturity alert |
 | v0.8 | Feature 2 — headroom overflow alert + 5-min runaway-rate alert |
 
+## Hardware verification status
+
+- **v0.4** — verified on hardware. Sensors + WiFi + Telegram + state machine all tested and working.
+- **v0.5-v0.8** — compile-verified only. Written and reviewed, but not yet run on hardware. Awaiting replacement VL53L0X sensor. First real-hardware test will validate thresholds and surface any issues.
+
 ## Alerts
 
 | Trigger | Message |
