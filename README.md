@@ -80,7 +80,10 @@ In the Arduino IDE the same setting is **Tools → Partition Scheme → Huge APP
 | `/api/prediction` | GET | the whole inference: phase, comparable cycles, prediction |
 | `/api/calibrate` | POST | sets the baseline; `{"ok":true,"baseline":mm}` |
 | `/api/config?jar=<mm>` | POST | sets jar interior height (persisted) |
+| `/api/config?mode=starter\|levain` | POST | switches mode; resets tracking to IDLE |
+| `/api/config?levain_target=<pct>` | POST | sets the levain target %% (persisted) |
 | `/api/reset` | POST | discards the in-progress cycle, back to IDLE |
+| `/api/reset_cycles` | POST | wipes saved cycles + maturity latch (LAN-trusted, no auth) |
 
 `/api/history` rows are `[t_seconds, dist_mm, rise_mm, temp_c10, hum_pct, state]`.
 `temp_c10` is temperature ×10 with `-32768` meaning "no reading"; `hum_pct` uses
@@ -95,11 +98,12 @@ In the Arduino IDE the same setting is **Tools → Partition Scheme → Huge APP
 | v0.6 | Feature 5 — NVS persistence, cycle history, true jar-geometry rise % |
 | v0.7 | Feature 3 — time-to-peak prediction, phase classification, maturity alert |
 | v0.8 | Feature 2 — headroom overflow alert + 5-min runaway-rate alert |
+| v0.9 | Feature 4 — starter / levain modes, target line, `/api/reset_cycles` |
 
 ## Hardware verification status
 
 - **v0.4** — verified on hardware. Sensors + WiFi + Telegram + state machine all tested and working.
-- **v0.5-v0.8** — compile-verified only. Written and reviewed, but not yet run on hardware. Awaiting replacement VL53L0X sensor. First real-hardware test will validate thresholds and surface any issues.
+- **v0.5-v0.9** — compile-verified only. Written and reviewed, but not yet run on hardware. Awaiting replacement VL53L0X sensor. First real-hardware test will validate thresholds and surface any issues.
 
 ## Alerts
 
@@ -112,6 +116,24 @@ In the Arduino IDE the same setting is **Tools → Partition Scheme → Huge APP
 | Slope ≥ 3 mm/min over 5 min | ⚡ runaway fermentation — re-arms below 1.5 mm/min |
 | 30 min before predicted peak | ⏰ peak expected — once per cycle |
 | 3 comparable cycles all doubled | 🎉 mature starter — once per starter, latched in NVS |
+| Levain target reached | 🎯 `Target reached (X%) at Y min — use now` — once per calibration |
+
+## Modes
+
+| | Starter mode (default) | Levain / dough mode |
+|---|---|---|
+| Tracks | full rise / peak / fall cycle | rise to a target %% |
+| Alerts | rising, peaked, falling | target reached, then peaked |
+| Cycle history | recorded, trains prediction | **not** recorded |
+| Dashboard | prediction, phase, cycle table | rise, chart, target line |
+
+Levain builds are deliberately excluded from cycle history: different flour,
+hydration and quantity from the maintenance starter, so folding them into the
+same history would poison the prediction model with cycles that are not
+comparable.
+
+Switching mode resets tracking to IDLE and requires re-calibration. The target
+percentage is only editable while in levain mode.
 
 ## Tuning
 
