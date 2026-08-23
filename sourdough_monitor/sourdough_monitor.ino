@@ -87,7 +87,7 @@ const int BUTTON_PIN = 19;
 // Measure this from the SENSOR FACE (lid underside, lid closed) to the
 // INSIDE BOTTOM of the jar. That is the distance the sensor would read with
 // an empty jar, and it is what makes rise % mean "doubled".
-const uint16_t JAR_INTERIOR_HEIGHT_MM_DEFAULT = 140;
+const uint16_t JAR_INTERIOR_HEIGHT_MM_DEFAULT = 165;
 
 const int16_t RISING_THRESHOLD_MM  = 3;
 const int16_t PEAK_PLATEAU_MINUTES = 10;
