@@ -26,7 +26,28 @@ struct Sample {
   uint8_t  state;     // index into stateNames[]
 };
 
+// Cycle.flags bits (v1.1).
+//   CYC_INVALID    — user marked it bad, or it was auto-flagged as implausible.
+//                    Kept in history but excluded from prediction and maturity.
+//   CYC_AUTOFLAG   — *we* raised the suspicion, not the user. Lets the
+//                    dashboard say "looks unusual" rather than "you rejected
+//                    this", and lets the user clear it without ambiguity.
+const uint8_t CYC_INVALID  = 0x01;
+const uint8_t CYC_AUTOFLAG = 0x02;
+
 // One completed feed-to-peak cycle, persisted to NVS.
+//
+// v1.1 NVS COMPATIBILITY NOTE
+// ---------------------------
+// `flags` was added in v1.1. It lands in what was previously a tail padding
+// byte: the struct is 4-byte aligned because of `timestamp`, so v0.9's 22
+// bytes of members already occupied 24 bytes, and 23 bytes still do. sizeof
+// is therefore UNCHANGED, the saved blob still passes loadCycles()' size
+// check, and pam's existing cycle history survives the upgrade instead of
+// being silently wiped. The static_assert in the .ino enforces this; if a
+// future field breaks 24 bytes, that assert fires at compile time rather than
+// eating someone's history at boot. loadCycles() masks the byte on read
+// because a padding byte's value was never formally guaranteed.
 struct Cycle {
   uint32_t timestamp;         // epoch of the feed, 0 if NTP was down
   uint16_t baseline_mm;       // lid-to-surface at feed time
@@ -39,6 +60,7 @@ struct Cycle {
   int16_t  baseline_temp_c10; // temp at feed time — the "+/-3 C of baseline"
                               // rule is relative to THIS, not the mean
   uint16_t peak_hold_min;     // PEAKED -> FALLING duration, 0 if still held
+  uint8_t  flags;             // v1.1: CYC_INVALID | CYC_AUTOFLAG (see above)
 };
 
 // The in-progress cycle as written to NVS, so a power cut doesn't lose it.
