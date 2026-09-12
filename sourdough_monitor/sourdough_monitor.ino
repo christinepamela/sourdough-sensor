@@ -1,5 +1,5 @@
 /*
-  Sourdough Starter Monitor — v1.4
+  Sourdough Starter Monitor — v1.5
   ================================
   Baseline: pam's v0.4 (archived). v0.5 added the web dashboard.
 
@@ -76,6 +76,25 @@
   + Weak cycle detection: alerts on declining peaks across 3+ cycles.
   + Cycle history management: individual delete + mark-invalid endpoints.
   + JAR_INTERIOR_HEIGHT_MM_DEFAULT corrected to 175 (was 165 experimental).
+
+  WHAT CHANGED IN v1.5 - ACCURATE CYCLE STATUS, RATE, TREND CHARTS (Pam)
+  -----------------------------------------------------------------------
+  + Cycle history no longer mislabels a cut-short cycle as "no peak". Each
+    cycle now records the highest state it actually reached: initial,
+    rising, peaked, or falling — independent of whether the fall was ever
+    confirmed before the next feed. A cycle fed right after PEAKED shows
+    "peaked" with a real time-to-peak, not blank.
+  + Time-to-peak is captured at the moment PEAKED is confirmed (not only
+    when a fall later confirms the cycle), and survives secondary rises.
+  + New "Rate" column: peak rise / time-to-peak, in mm/hr.
+  + New "Maturity trend" section below Completed cycles: three small
+    sparkline charts (peak rise, time-to-peak, rise rate) across recent
+    cycles, so progress is visible at a glance. Fully separate from the
+    existing 24h chart — doesn't touch it.
+  + NOTE: the Cycle struct grew by one byte (status field), which changes
+    its size in NVS. On first boot after flashing v1.5 the saved cycle
+    history will reset to empty (loadCycles() detects the size mismatch
+    and starts clean) — the 24h chart and live state are unaffected.
 
   WHAT CHANGED IN v1.4 - FREEZE TEMP/HUM DURING FEEDING MODE (Pam)
   -----------------------------------------------------------------
@@ -382,6 +401,16 @@ int16_t  temp_min_c10 = INT16_MAX;
 int16_t  temp_max_c10 = INT16_MIN;
 int16_t  baseline_temp_c10 = INT16_MIN;  // temp at feed time
 unsigned long peaked_time = 0;    // when PEAKED was entered, 0 if not yet
+// Pam v1.5: highest state actually reached this cycle, independent of the
+// live `state` variable (which can drop back to RISING on a secondary rise).
+// Used so a cycle cut short by a feed is labeled by what really happened —
+// "peaked", not "no peak" — instead of only recording completed falls.
+uint8_t highest_state_this_cycle = ST_INITIAL;
+// First moment PEAKED was confirmed this cycle. Unlike peaked_time (which
+// resets to 0 on a secondary rise), this is captured once and kept, so
+// "time to peak" survives even if fed before the fall confirms, or if a
+// secondary rise happens afterwards.
+unsigned long first_peaked_time = 0;
 bool     cycle_recorded = false;  // has this cycle been written to history?
 
 // Prediction state (feature 3). Both alerts are one-shot per cycle/starter.
@@ -1109,13 +1138,15 @@ void checkWeakCycles() {
   Serial.println(")");
 }
 
-// Record the just-finished cycle. peaked=false means it never reached PEAKED,
-// which is itself a signal (a "silent" starter) worth keeping.
+// Record the just-finished cycle. status reflects the highest state it
+// actually reached (initial/rising/peaked/falling) — a cycle cut short by
+// a feed right after peaking is labeled "peaked", not lumped in with one
+// that never rose at all.
 //
 // Levain builds are deliberately NOT recorded: different flour, hydration and
 // quantity from the maintenance starter, so folding them into the same history
 // would poison the prediction model with cycles that aren't comparable.
-void closeCycle(bool peaked) {
+void closeCycle() {
   if (state == ST_IDLE || cycle_recorded) return;
   if (mode == MODE_LEVAIN) { cycle_recorded = true; return; }
 
@@ -1124,7 +1155,9 @@ void closeCycle(bool peaked) {
   c.baseline_mm      = baseline_dist;
   c.jar_height_mm    = jar_height_mm;
   c.peak_rise_mm     = peak_rise_mm;
-  c.time_to_peak_min = peaked ? (uint16_t)((peak_time - baseline_time) / 60000) : 0;
+  c.status           = highest_state_this_cycle;
+  c.time_to_peak_min = (highest_state_this_cycle >= ST_PEAKED)
+                        ? (uint16_t)((first_peaked_time - baseline_time) / 60000) : 0;
   c.avg_temp_c10     = temp_n ? (int16_t)lroundf(temp_sum * 10.0f / (float)temp_n)
                               : INT16_MIN;
   c.temp_min_c10     = (temp_min_c10 == INT16_MAX) ? INT16_MIN : temp_min_c10;
@@ -1155,7 +1188,7 @@ void calibrate(uint16_t d) {
   // anyway (only once it had a fair chance) so silent cycles are visible.
   if (state != ST_IDLE && !cycle_recorded) {
     unsigned long ran_min = (millis() - baseline_time) / 60000;
-    if (ran_min >= 60) closeCycle(false);
+    if (ran_min >= 60) closeCycle();
   }
 
   baseline_dist = d;
@@ -1163,6 +1196,8 @@ void calibrate(uint16_t d) {
   peak_rise_mm = 0;
   peak_time = baseline_time;
   state = ST_INITIAL;
+  highest_state_this_cycle = ST_INITIAL;   // v1.5
+  first_peaked_time = 0;                   // v1.5
   for (int i = 0; i < SMOOTH_N; i++) dist_buffer[i] = d;
   buffer_full = true;
 
@@ -1437,6 +1472,7 @@ void updateState(int16_t rise_mm) {
       if (rise_mm >= rising_threshold_mm) {
         if (++rise_consec >= RISING_CONSEC) {
           state = ST_RISING;
+          if (highest_state_this_cycle < ST_RISING) highest_state_this_cycle = ST_RISING;
           Serial.print(">> State: RISING (rise ");
           Serial.print(rise_mm); Serial.print(" mm x");
           Serial.print(RISING_CONSEC); Serial.println(" samples)");
@@ -1460,6 +1496,8 @@ void updateState(int16_t rise_mm) {
       if (tall_enough && sustained_ok && stable_ok) {
         state = ST_PEAKED;
         peaked_time     = now;
+        if (highest_state_this_cycle < ST_PEAKED) highest_state_this_cycle = ST_PEAKED;
+        if (!first_peaked_time) first_peaked_time = now;   // v1.5: capture once
         peak_at_confirm = peak_rise_mm;
         falling_pending = false;
         Serial.print(">> State: PEAKED (holding ");
@@ -1491,10 +1529,11 @@ void updateState(int16_t rise_mm) {
           Serial.println(" mm), confirming...");
         } else if ((now - fall_since_ms) / 60000 >= fall_stable_minutes) {
           state = ST_FALLING;
+          if (highest_state_this_cycle < ST_FALLING) highest_state_this_cycle = ST_FALLING;
           Serial.print(">> State: FALLING (confirmed over ");
           Serial.print(fall_stable_minutes); Serial.println(" min)");
           // The peak is real and over: NOW record the cycle.
-          closeCycle(true);
+          closeCycle();
           backfillPeakHold();
           checkMaturity();
           checkWeakCycles();
@@ -1670,12 +1709,16 @@ footer{color:var(--dim);font-size:12px;padding:0 20px 20px;max-width:900px}
   <div class="starter-only">
     <h2>Completed cycles</h2>
     <table id="cyc"><thead><tr>
-      <th>Fed</th><th>Peak</th><th>Rise %</th><th>To peak</th><th>Temp</th><th></th>
-    </tr></thead><tbody></tbody></table>
+      <th>Fed</th><th>Peak</th><th>Rise %</th><th>To peak</th><th>Rate</th><th>Temp</th><th></th></tr></thead><tbody></tbody></table>
     <div class="row">
       <button id="wipe">Wipe cycle history</button>
       <span id="wipemsg" style="font-size:13px;color:var(--dim)"></span>
     </div>
+  </div>
+
+  <div class="starter-only">
+    <h2>Maturity trend</h2>
+    <div id="trendCharts" style="display:flex;flex-wrap:wrap;gap:16px"></div>
   </div>
 </main>
 
@@ -1796,13 +1839,17 @@ async function loadCycles(){
     const j=await r.json();
     const tb=$('cyc').querySelector('tbody'); tb.innerHTML='';
     if(!j.cycles.length){
-      tb.innerHTML='<tr><td colspan="6" style="color:var(--dim)">'+
-        'No completed cycles yet. One gets saved each time the starter peaks.</td></tr>';
+      tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">'+
+        'No completed cycles yet. One gets saved each time the starter rises.</td></tr>';
       return;
     }
+    const statusLabel=['initial','rising','peaked','falling'];
+    const statusClass=['none','','','good'];
     j.cycles.slice().reverse().forEach(c=>{
       const sh=c.jar_height_mm-c.baseline_mm;
       const pct=sh>0? (100*c.peak_rise_mm/sh) : null;
+      const rateMmHr=(c.time_to_peak_min>0)? (c.peak_rise_mm/(c.time_to_peak_min/60)) : null;
+      const st=c.status||0;
       const tr=document.createElement('tr');
       tr.innerHTML =
         '<td>'+(c.timestamp? new Date(c.timestamp*1000)
@@ -1811,14 +1858,57 @@ async function loadCycles(){
         '<td>'+c.peak_rise_mm+' mm</td>'+
         '<td>'+(pct==null?'&mdash;':pct.toFixed(0)+'%')+'</td>'+
         '<td>'+(c.time_to_peak_min? fmtDur(c.time_to_peak_min):'&mdash;')+'</td>'+
+        '<td>'+(rateMmHr==null?'&mdash;':rateMmHr.toFixed(1)+' mm/hr')+'</td>'+
         '<td>'+(c.avg_temp_c==null?'&mdash;':c.avg_temp_c.toFixed(1)+'\u00b0')+'</td>'+
-        '<td>'+(c.time_to_peak_min===0
-                 ? '<span class="tag none">no peak</span>'
-                 : (pct!=null&&pct>=100? '<span class="tag good">doubled</span>'
-                                       : '<span class="tag">peaked</span>'))+'</td>';
+        '<td><span class="tag '+statusClass[st]+'">'+statusLabel[st]+'</span></td>';
       tb.appendChild(tr);
     });
+    renderTrendCharts(j.cycles);
   }catch(e){}
+}
+
+// Pam v1.5: three small trend sparklines (peak rise, time-to-peak, rise
+// rate) across the last cycles, so maturity progress is visible at a
+// glance. Independent of the main 24h chart — own section, own function,
+// nothing here touches draw().
+function renderTrendCharts(cycles){
+  const box=$('trendCharts');
+  if(!cycles.length){ box.innerHTML='<p style="color:var(--dim)">Not enough cycles yet.</p>'; return; }
+  const ordered=cycles.slice(); // already oldest-first from the API
+  const peakSeries=ordered.map(c=>c.peak_rise_mm);
+  const peakedOnly=ordered.filter(c=>(c.status||0)>=2 && c.time_to_peak_min>0);
+  const t2pSeries=peakedOnly.map(c=>c.time_to_peak_min/60); // hours
+  const rateSeries=peakedOnly.map(c=>c.peak_rise_mm/(c.time_to_peak_min/60));
+
+  function spark(title,unit,values){
+    if(!values.length) return '<div style="flex:1;min-width:220px"><h3 style="margin:4px 0">'+title+'</h3>'+
+      '<p style="color:var(--dim);font-size:13px">No peaked cycles yet.</p></div>';
+    const w=260,h=90,pad=8;
+    const min=Math.min(...values), max=Math.max(...values);
+    const range=(max-min)||1;
+    const stepX=values.length>1? (w-2*pad)/(values.length-1) : 0;
+    const pts=values.map((v,i)=>{
+      const x=pad+i*stepX;
+      const y=h-pad-((v-min)/range)*(h-2*pad);
+      return x.toFixed(1)+','+y.toFixed(1);
+    }).join(' ');
+    const dots=values.map((v,i)=>{
+      const x=pad+i*stepX;
+      const y=h-pad-((v-min)/range)*(h-2*pad);
+      return '<circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+'" r="2.5" fill="var(--accent,#4a9)"/>';
+    }).join('');
+    const last=values[values.length-1];
+    return '<div style="flex:1;min-width:220px">'+
+      '<h3 style="margin:4px 0">'+title+' <span style="font-weight:400;color:var(--dim);font-size:13px">('+last.toFixed(1)+unit+' latest)</span></h3>'+
+      '<svg viewBox="0 0 '+w+' '+h+'" style="width:100%;height:90px">'+
+      '<polyline points="'+pts+'" fill="none" stroke="var(--accent,#4a9)" stroke-width="2"/>'+
+      dots+'</svg></div>';
+  }
+
+  box.innerHTML =
+    spark('Peak rise', 'mm', peakSeries) +
+    spark('Time to peak', 'h', t2pSeries) +
+    spark('Rise rate', 'mm/hr', rateSeries);
 }
 
 function draw(){
@@ -2130,12 +2220,14 @@ void handleHistoryCycles() {
     j += ",\"jar_height_mm\":" + String(c.jar_height_mm);
     j += ",\"peak_rise_mm\":" + String(c.peak_rise_mm);
     j += ",\"time_to_peak_min\":" + String(c.time_to_peak_min);
+    j += ",\"status\":" + String(c.status);
     j += ",\"avg_temp_c\":" + (c.avg_temp_c10 == INT16_MIN ? String("null")
                                 : String(c.avg_temp_c10 / 10.0f, 1));
     j += ",\"temp_min_c\":" + (c.temp_min_c10 == INT16_MIN ? String("null")
                                 : String(c.temp_min_c10 / 10.0f, 1));
     j += ",\"temp_max_c\":" + (c.temp_max_c10 == INT16_MIN ? String("null")
                                 : String(c.temp_max_c10 / 10.0f, 1));
+    j += ",\"peak_hold_min\":" + String(c.peak_hold_min);
     j += "}";
   }
   j += "]}";
@@ -2192,7 +2284,7 @@ void handleConfig() {
     if (requested != mode) {
       if (mode == MODE_STARTER && state != ST_IDLE && !cycle_recorded) {
         unsigned long ran_min = (millis() - baseline_time) / 60000;
-        if (ran_min >= 60) closeCycle(false);
+        if (ran_min >= 60) closeCycle();
       }
       mode = requested;
       prefs.putUChar("mode", (uint8_t)mode);
@@ -2353,7 +2445,7 @@ void handleNotFound() { server.send(404, "text/plain", "not found"); }
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Sourdough Sensor v1.4 ===");
+  Serial.println("\n=== Sourdough Sensor v1.5 ===");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   // v1.1 hardware: feeding button and status LEDs (Section 2.3/6.0).
