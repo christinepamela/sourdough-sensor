@@ -1,5 +1,5 @@
 /*
-  Sourdough Starter Monitor — v1.6
+  Sourdough Starter Monitor — v1.5
   ================================
   Baseline: pam's v0.4 (archived). v0.5 added the web dashboard.
 
@@ -76,34 +76,6 @@
   + Weak cycle detection: alerts on declining peaks across 3+ cycles.
   + Cycle history management: individual delete + mark-invalid endpoints.
   + JAR_INTERIOR_HEIGHT_MM_DEFAULT corrected to 175 (was 165 experimental).
-
-  WHAT CHANGED IN v1.6 - STATUS OFF-BY-ONE FIX, RISE NUMBERING, CSV EXPORT
-  -------------------------------------------------------------------------
-  BUG FIX:
-  + v1.5's cycle status was off by one. highest_state_this_cycle stores the
-    raw State enum (ST_IDLE=0, ST_INITIAL=1 .. ST_FALLING=4), but the
-    dashboard's statusLabel[] is 0-based starting at "initial". So a 100%+
-    cycle that reached PEAKED (enum 3) displayed as "falling", and a cycle
-    that reached FALLING (enum 4) had no array slot and showed "undefined".
-    Fixed at the source: c.status = highest_state_this_cycle - ST_INITIAL.
-    Cycles already saved in the ring keep their old (wrong) label until
-    they age out; new cycles are correct immediately.
-
-  BUG FIX:
-  + Every staircase recovery (PEAKED/FALLING -> RISING again) was announced
-    as "Secondary rise detected", every time, no matter how many times it
-    happened in one cycle — so a 3rd or 4th recovery still read as the 2nd.
-    Now counted per-cycle (recovery_rise_n, reset at calibration alongside
-    highest_state_this_cycle) and reported with its real ordinal: "3rd rise
-    detected", "4th rise detected", etc. The first INITIAL->RISING is rise
-    #1, so the first recovery is rise #2 — matches how you were counting it.
-
-  NEW FEATURE:
-  + "⬇️ Download results (CSV)" button next to Wipe cycle history. Exports
-    the completed-cycles table (fed time, peak, rise %, time to peak, rate,
-    temps, peak-hold, status) before you wipe — so wrapping up a test (e.g.
-    a discard trial) leaves a record instead of disappearing when you start
-    tracking the mother starter fresh.
 
   WHAT CHANGED IN v1.5 - ACCURATE CYCLE STATUS, RATE, TREND CHARTS (Pam)
   -----------------------------------------------------------------------
@@ -440,12 +412,6 @@ uint8_t highest_state_this_cycle = ST_INITIAL;
 // secondary rise happens afterwards.
 unsigned long first_peaked_time = 0;
 bool     cycle_recorded = false;  // has this cycle been written to history?
-
-// v1.6: counts how many times THIS cycle has recovered from PEAKED/FALLING
-// back into RISING (a "staircase" starter). The first INITIAL->RISING is
-// rise #1, so the first recovery is rise #2, the next is #3, etc. Reset at
-// every calibration alongside highest_state_this_cycle.
-uint8_t  recovery_rise_n = 0;
 
 // Prediction state (feature 3). Both alerts are one-shot per cycle/starter.
 bool     prepeak_alert_sent = false;
@@ -1172,17 +1138,6 @@ void checkWeakCycles() {
   Serial.println(")");
 }
 
-// v1.6: "2nd", "3rd", "4th", "11th", "22nd", ... English ordinal suffix.
-const char* ordinalSuffix(uint8_t n) {
-  if (n % 100 >= 11 && n % 100 <= 13) return "th";
-  switch (n % 10) {
-    case 1: return "st";
-    case 2: return "nd";
-    case 3: return "rd";
-    default: return "th";
-  }
-}
-
 // Record the just-finished cycle. status reflects the highest state it
 // actually reached (initial/rising/peaked/falling) — a cycle cut short by
 // a feed right after peaking is labeled "peaked", not lumped in with one
@@ -1200,13 +1155,7 @@ void closeCycle() {
   c.baseline_mm      = baseline_dist;
   c.jar_height_mm    = jar_height_mm;
   c.peak_rise_mm     = peak_rise_mm;
-  // v1.6: statusLabel[] on the dashboard is 0-based (0=initial..3=falling)
-  // but the State enum is 1-based (ST_INITIAL=1..ST_FALLING=4) because
-  // ST_IDLE=0 sits in front of it. Storing the raw enum value put every
-  // cycle's label one slot off — a 100%+ "peaked" cycle (enum 3) indexed
-  // statusLabel[3]=='falling', and a genuinely-falling cycle (enum 4) had no
-  // slot at all and rendered "undefined". Subtracting ST_INITIAL re-bases it.
-  c.status           = highest_state_this_cycle - ST_INITIAL;
+  c.status           = highest_state_this_cycle;
   c.time_to_peak_min = (highest_state_this_cycle >= ST_PEAKED)
                         ? (uint16_t)((first_peaked_time - baseline_time) / 60000) : 0;
   c.avg_temp_c10     = temp_n ? (int16_t)lroundf(temp_sum * 10.0f / (float)temp_n)
@@ -1249,7 +1198,6 @@ void calibrate(uint16_t d) {
   state = ST_INITIAL;
   highest_state_this_cycle = ST_INITIAL;   // v1.5
   first_peaked_time = 0;                   // v1.5
-  recovery_rise_n = 0;                     // v1.6
   for (int i = 0; i < SMOOTH_N; i++) dist_buffer[i] = d;
   buffer_full = true;
 
@@ -1505,21 +1453,12 @@ void updateState(int16_t rise_mm) {
     last_newmax_ms  = now;
     falling_pending = false;
     peaked_time     = 0;
-    // The first INITIAL->RISING was rise #1, so the first recovery
-    // (recovery_rise_n going 0->1) is rise #2, the next is #3, etc. — fixes
-    // every recovery being announced as "Secondary rise" regardless of count.
-    recovery_rise_n++;
-    uint8_t rise_num = recovery_rise_n + 1;
-    Serial.print(">> State: RISING (");
-    Serial.print(rise_num);
-    Serial.print(ordinalSuffix(rise_num));
-    Serial.print(" rise — ");
+    Serial.print(">> State: RISING (secondary rise — ");
     Serial.print(rise_mm);
     Serial.print(" mm exceeds confirmed peak ");
     Serial.print(peak_at_confirm);
     Serial.println(" mm)");
-    sendTelegram("📈 " + String(rise_num) + String(ordinalSuffix(rise_num)) +
-                 " rise detected\n"
+    sendTelegram("📈 Secondary rise detected\n"
                  "Now " + String(rise_mm) + " mm, past the earlier "
                  + String(peak_at_confirm) + " mm hold.\n"
                  "Still climbing — the cycle isn't over.");
@@ -1772,7 +1711,6 @@ footer{color:var(--dim);font-size:12px;padding:0 20px 20px;max-width:900px}
     <table id="cyc"><thead><tr>
       <th>Fed</th><th>Peak</th><th>Rise %</th><th>To peak</th><th>Rate</th><th>Temp</th><th></th></tr></thead><tbody></tbody></table>
     <div class="row">
-      <button id="cyccsv">⬇️ Download results (CSV)</button>
       <button id="wipe">Wipe cycle history</button>
       <span id="wipemsg" style="font-size:13px;color:var(--dim)"></span>
     </div>
@@ -1895,12 +1833,10 @@ async function loadPrediction(){
   }catch(e){}
 }
 
-let lastCycles=[];   // mirrored each poll so the download button needs no refetch
 async function loadCycles(){
   try{
     const r=await fetch('/api/history_cycles',{cache:'no-store'});
     const j=await r.json();
-    lastCycles=j.cycles||[];
     const tb=$('cyc').querySelector('tbody'); tb.innerHTML='';
     if(!j.cycles.length){
       tb.innerHTML='<tr><td colspan="7" style="color:var(--dim)">'+
@@ -2144,41 +2080,8 @@ $('savetarget').onclick=async()=>{
   tick();
 };
 
-// v1.6: wrap up a test run (e.g. a discard trial) by exporting the
-// completed-cycles table to CSV before wiping it, so finishing a test
-// leaves a record instead of just disappearing when you start tracking the
-// mother starter (or a new test) fresh.
-$('cyccsv').onclick=()=>{
-  if(!lastCycles.length){ $('wipemsg').textContent='no completed cycles to export yet'; return; }
-  const statusLabel=['initial','rising','peaked','falling'];
-  const rows=[['fed_at','baseline_mm','jar_height_mm','peak_rise_mm','rise_pct',
-               'time_to_peak_min','rate_mm_per_hr','avg_temp_c','temp_min_c',
-               'temp_max_c','peak_hold_min','status']];
-  lastCycles.forEach(c=>{
-    const sh=c.jar_height_mm-c.baseline_mm;
-    const pct=sh>0? (100*c.peak_rise_mm/sh) : '';
-    const rate=(c.time_to_peak_min>0)? (c.peak_rise_mm/(c.time_to_peak_min/60)) : '';
-    rows.push([
-      c.timestamp? new Date(c.timestamp*1000).toISOString() : '',
-      c.baseline_mm, c.jar_height_mm, c.peak_rise_mm,
-      pct===''?'':pct.toFixed(0), c.time_to_peak_min,
-      rate===''?'':rate.toFixed(1),
-      c.avg_temp_c==null?'':c.avg_temp_c.toFixed(1),
-      c.temp_min_c==null?'':c.temp_min_c.toFixed(1),
-      c.temp_max_c==null?'':c.temp_max_c.toFixed(1),
-      c.peak_hold_min, statusLabel[c.status||0]
-    ]);
-  });
-  const blob=new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'});
-  const a=document.createElement('a');
-  const stamp=new Date().toISOString().slice(0,16).replace(/[:T]/g,'-');
-  a.href=URL.createObjectURL(blob); a.download='sourdough_cycles_'+stamp+'.csv'; a.click();
-};
-
 $('wipe').onclick=async()=>{
-  if(!confirm('Erase all saved cycles? Download results first if you want to '+
-              'keep them — wiping is how you start clean for the mother '+
-              'starter (or a new test). Peak prediction and phase '+
+  if(!confirm('Erase all saved cycles? Peak prediction and phase '+
               'classification start over from nothing.')) return;
   try{ const r=await fetch('/api/reset_cycles',{method:'POST'});
        const j=await r.json();
@@ -2542,7 +2445,7 @@ void handleNotFound() { server.send(404, "text/plain", "not found"); }
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n=== Sourdough Sensor v1.6 ===");
+  Serial.println("\n=== Sourdough Sensor v1.5 ===");
 
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   // v1.1 hardware: feeding button and status LEDs (Section 2.3/6.0).
